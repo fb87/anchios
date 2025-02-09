@@ -11,7 +11,7 @@
       pkgs = import nixpkgs { system = "x86_64-linux"; };
 
       kernel = "${pkgs.linuxPackages_latest.kernel}/bzImage";
-      initrd = pkgs.runCommand "build-initrd" { buildInputs = [ pkgs.fakeroot ]; } ''
+      initrd = pkgs.runCommand "initrd.gz" { } ''
         mkdir tmp
 
         # generate the initrd
@@ -106,11 +106,48 @@
           mkdir -p home/user && chown 1000:100 -R home/user
 
           # to be able to have correct permission
-          fakeroot sh -c "find . | ${pkgs.cpio}/bin/cpio --quiet -H newc -o | gzip -9 -n > $out"
+          ${pkgs.fakeroot}/bin/fakeroot sh -c "find . | ${pkgs.cpio}/bin/cpio --quiet -H newc -o | gzip -9 -n > $out"
         )
       '';
 
-      iso = pkgs.runCommandNoCC "gen-iso" ''
+      iso = pkgs.runCommandNoCC "gen-iso" {
+        nativeBuildInputs = [ pkgs.grub2_efi pkgs.libisoburn pkgs.mtools ];
+      } ''
+        set -x
+
+        mkdir -p iso/boot/grub
+        mkdir -p iso/EFI/BOOT
+
+        # Copy Kernel and Initramfs
+        cp -v ${kernel} iso/boot/vmlinuz
+        cp -v ${initrd} iso/boot/initrd.gz
+
+        cat <<-EOF > iso/boot/grub/grub.cfg
+        set default=0
+        set timeout=10
+
+        insmod all_video
+        insmod progress
+        set pager=1
+        set gfxpayload=keep
+        set timeout=1
+
+        menuentry 'Anchi Linux' --class os {
+            insmod gzio
+            insmod part_msdos
+
+            linux  /boot/vmlinuz
+            initrd /boot/initrd.gz
+        }
+        EOF
+
+        # Create bootable ISO with mkisofs
+        grub-mkstandalone \
+          --format=x86_64-efi \
+          --output=iso/EFI/BOOT/BOOTX64.EFI \
+          --modules="normal iso9660 linux search search_label search_fs_uuid ls" \
+          "boot/grub/grub.cfg=iso/boot/grub/grub.cfg"
+        grub-mkrescue -o $out  iso   --modules="linux normal iso9660 search search_label search_fs_uuid ls" --compress=xz
       '';
 
       rootfs = "/tmp/rootfs.img";
@@ -124,8 +161,19 @@
           -device e1000,netdev=net0 \
           -append 'root=/dev/ram rdinit=/init console=ttyS0,115200 loglevel=4'
       '';
+
+      boot-iso = pkgs.writeShellScriptBin "boot-iso" ''
+        ${pkgs.qemu_kvm}/bin/qemu-kvm  -name singoc \
+          -m 2048 -smp 4 -cdrom ${iso} \
+          -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+          -device e1000,netdev=net0 \
+          -drive if=pflash,format=raw,readonly=on,file=${pkgs.OVMF.fd}/FV/OVMF.fd \
+          -boot d
+      '';
     in
     {
-      packages.x86_64-linux.default = runvm;
+      packages.x86_64-linux.iso = iso;
+      packages.x86_64-linux.runvm = runvm;
+      packages.x86_64-linux.default = boot-iso;
     };
 }
